@@ -62,7 +62,7 @@ async function markOrderPaid(orderId, transactionId, amount) {
 /* -------------------- ROUTES -------------------- */
 
 /** Health check */
-app.get("/", (_, res) => {
+app.get("/health", (_, res) => {
   res.json({ status: "OK" });
 });
 
