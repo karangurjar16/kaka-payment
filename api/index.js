@@ -1,117 +1,145 @@
-import axios from "axios";
-import CryptoJS from "crypto-js";
+const express = require("express");
+const serverless = require("serverless-http");
+const crypto = require("crypto");
+const axios = require("axios");
 
-function json(res, status, body) {
-  res.statusCode = status;
-  res.setHeader("Content-Type", "application/json");
-  res.end(JSON.stringify(body));
-}
+const app = express();
 
-function generateChecksum(payload, secret) {
+/* -------------------- MIDDLEWARE -------------------- */
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+/* -------------------- UTILS -------------------- */
+function generateSignature(payload) {
   const data = Object.keys(payload)
-    .filter(k => k !== "checksum")
+    .filter(k => k !== "signature")
     .sort()
     .map(k => `${k}=${payload[k]}`)
     .join("&");
 
-  return CryptoJS.HmacSHA256(data, secret).toString();
+  return crypto
+    .createHmac("sha256", process.env.PINE_SECRET_KEY)
+    .update(data)
+    .digest("hex");
 }
 
-export default async function handler(req, res) {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const path = url.pathname.replace("/api", "") || "/";
+function verifySignature(payload) {
+  if (!payload.signature) return false;
 
-  /* ---------------- HEALTH ---------------- */
-  if (path === "/health") {
-    return json(res, 200, { status: "OK" });
+  const received = payload.signature;
+  const expected = generateSignature(payload);
+
+  return crypto.timingSafeEqual(
+    Buffer.from(received),
+    Buffer.from(expected)
+  );
+}
+
+/* -------------------- SHOPPLAZA CLIENT -------------------- */
+const shopplaza = axios.create({
+  baseURL: `https://${process.env.SHOPPLAZA_STORE_DOMAIN}/admin/api`,
+  headers: {
+    "X-Shopplaza-Access-Token": process.env.SHOPPLAZA_ACCESS_TOKEN,
+    "Content-Type": "application/json"
   }
+});
 
-  /* ---------------- INITIATE ---------------- */
-  if (path === "/initiate" && req.method === "GET") {
-    const order_id = url.searchParams.get("order_id");
-    if (!order_id) return json(res, 400, { error: "order_id required" });
+async function markOrderPaid(orderId, transactionId, amount) {
+  const orderRes = await shopplaza.get(`/orders/${orderId}.json`);
+  const order = orderRes.data.order;
 
-    const shopplaza = axios.create({
-      baseURL: `${process.env.SHOPPLAZA_STORE_URL}/admin/api`,
-      headers: {
-        "X-Shopplaza-Access-Token": process.env.SHOPPLAZA_ACCESS_TOKEN
-      }
-    });
+  if (order.financial_status === "paid") return;
 
-    const orderRes = await shopplaza.get(`/orders/${order_id}.json`);
-    const order = orderRes.data.order;
+  await shopplaza.post(`/orders/${orderId}/transactions.json`, {
+    transaction: {
+      kind: "sale",
+      status: "success",
+      gateway: "Pine Labs",
+      authorization: transactionId,
+      amount
+    }
+  });
+}
+
+/* -------------------- ROUTES -------------------- */
+
+/**
+ * Health check
+ */
+app.get("/health", (_, res) => {
+  res.json({ status: "OK" });
+});
+
+/**
+ * 1️⃣ Payment Initiation (Shopplaza → Backend)
+ */
+app.post("/payment/initiate", async (req, res) => {
+  try {
+    const order = req.body;
 
     const payload = {
-      merchant_id: process.env.PINELABS_MERCHANT_ID,
+      merchant_id: process.env.PINE_MERCHANT_ID,
       order_id: order.id,
       amount: order.total_price,
       currency: "INR",
-      customer_email: order.email,
-      return_url: `${process.env.BASE_URL}/api/return`,
-      notify_url: `${process.env.BASE_URL}/api/webhook`
+      customer_email: order.customer?.email || "",
+      customer_mobile: order.customer?.phone || "",
+      return_url: `${process.env.BASE_URL}/payment/return`,
+      notify_url: `${process.env.BASE_URL}/payment/webhook`
     };
 
-    payload.checksum = generateChecksum(
-      payload,
-      process.env.PINELABS_SECRET_KEY
-    );
+    payload.signature = generateSignature(payload);
 
     const redirectUrl =
-      process.env.PINELABS_PAYMENT_URL +
+      process.env.PINE_PAYMENT_URL +
       "?" +
       new URLSearchParams(payload).toString();
 
-    res.statusCode = 302;
-    res.setHeader("Location", redirectUrl);
-    return res.end();
+    res.redirect(302, redirectUrl);
+  } catch (err) {
+    console.error("INITIATE ERROR:", err);
+    res.status(500).send("Payment initiation failed");
+  }
+});
+
+/**
+ * 2️⃣ Return URL (browser redirect only)
+ */
+app.all("/payment/return", (req, res) => {
+  const status = req.query.status || req.body?.status;
+
+  if (status === "SUCCESS") {
+    return res.redirect(
+      `https://${process.env.SHOPPLAZA_STORE_DOMAIN}/checkout/thank_you`
+    );
   }
 
-  /* ---------------- WEBHOOK ---------------- */
-  if (path === "/webhook" && req.method === "POST") {
-    const body = req.body;
-    const valid =
-      generateChecksum(body, process.env.PINELABS_SECRET_KEY) === body.checksum;
+  return res.redirect(
+    `https://${process.env.SHOPPLAZA_STORE_DOMAIN}/cart`
+  );
+});
 
-    if (!valid) return json(res, 400, { error: "invalid checksum" });
-
-    if (body.status === "SUCCESS") {
-      await axios.post(
-        `${process.env.SHOPPLAZA_STORE_URL}/admin/api/orders/${body.order_id}/transactions.json`,
-        {
-          transaction: {
-            kind: "sale",
-            status: "success",
-            gateway: "Pine Labs",
-            authorization: body.transaction_id
-          }
-        },
-        {
-          headers: {
-            "X-Shopplaza-Access-Token":
-              process.env.SHOPPLAZA_ACCESS_TOKEN
-          }
-        }
-      );
+/**
+ * 3️⃣ Webhook (ONLY place where order is marked PAID)
+ */
+app.post("/payment/webhook", async (req, res) => {
+  try {
+    if (!verifySignature(req.body)) {
+      return res.status(400).send("Invalid signature");
     }
 
-    return json(res, 200, { ok: true });
+    const { order_id, transaction_id, status, amount } = req.body;
+
+    if (status === "SUCCESS") {
+      await markOrderPaid(order_id, transaction_id, amount);
+    }
+
+    res.status(200).send("OK");
+  } catch (err) {
+    console.error("WEBHOOK ERROR:", err);
+    res.status(500).send("Webhook failed");
   }
+});
 
-  /* ---------------- RETURN ---------------- */
-  if (path === "/return") {
-    const order_id = url.searchParams.get("order_id");
-    const status = url.searchParams.get("status");
-
-    const redirect =
-      status === "SUCCESS"
-        ? `${process.env.SHOPPLAZA_STORE_URL}/checkout/thank_you?order_id=${order_id}`
-        : `${process.env.SHOPPLAZA_STORE_URL}/checkout/payment_failed`;
-
-    res.statusCode = 302;
-    res.setHeader("Location", redirect);
-    return res.end();
-  }
-
-  /* ---------------- NOT FOUND ---------------- */
-  json(res, 404, { error: "Route not found" });
-}
+/* -------------------- EXPORT -------------------- */
+module.exports = serverless(app);

@@ -1,9 +1,10 @@
 {
   "name": "pinelabs-shopplaza",
   "version": "1.0.0",
-  "type": "module",
+  "private": true,
   "dependencies": {
     "axios": "^1.6.0",
-    "crypto-js": "^4.2.0"
+    "express": "^4.19.2",
+    "serverless-http": "^4.0.0"
   }
 }
